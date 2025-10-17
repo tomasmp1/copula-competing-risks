@@ -1,0 +1,366 @@
+---
+title: "Using Copulas in the Analysis of Competing Risks"
+authors: "Tomas Power"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup}
+library(copula)
+library(fitdistrplus)
+library(survival)
+library(ggplot2)
+
+set.seed(6)
+```
+
+# Clayton Copula & Exponential Marginals
+
+This notebook demonstrates the use of a Clayton copula to model competing risks in synthetic time-to-event data. It includes data generation, fitting exponential marginals, parameter estimation via MLE and bootstrap, and visualization of results.
+
+## Data Generation
+
+### Generate Synthetic Data with Clayton Copula
+
+Two dependent failure times (T1, T2) representing loan repayment and loan default (the competing risks) are simulated using a Clayton copula to induce positive dependence.
+
+```{r data-generation}
+# Parameters
+copula_theta <- 2
+exp_rate1 <- 4
+exp_rate2 <- 2.5
+n <- 10000
+
+# Generate copula samples
+clayton_cop <- claytonCopula(param = copula_theta)
+u <- rCopula(n, clayton_cop)
+
+# Transform to exponential marginals
+T1 <- qexp(u[, 1], rate = exp_rate1)
+T2 <- qexp(u[, 2], rate = exp_rate2)
+
+# Observed loan closure time and cause
+closure_time <- pmin(T1, T2)
+event_type <- ifelse(T1 < T2, 1, 2)  # 1 = repayment, 2 = default
+
+# Final dataset
+simulated_data <- data.frame(closure_time, event_type)
+head(simulated_data)
+```
+
+### Visualize Copula Dependence
+
+A scatterplot of copula samples (u1, u2) illustrates the dependence structure imposed by the Clayton copula.
+
+```{r copula-scatterplot}
+plot(u, main = "Copula Samples (Clayton)", xlab = "u1", ylab = "u2", pch = 20, col = rgb(0, 0, 1, 0.2))
+```
+
+### Visualize Closure Times by Event Type
+
+A histogram of closure times colored by event type shows the distribution of observed closures from repayment and default.
+
+```{r closure-time-hist}
+ggplot(simulated_data, aes(x = closure_time, fill = factor(event_type))) +
+  geom_histogram(position = "identity", bins = 50, alpha = 0.6) +
+  labs(title = "Histogram of Closure Times", x = "Time", y = "Count", fill = "Event Type") +
+  scale_fill_manual(values = c("steelblue", "tomato"),
+                    labels = c("Repayment", "Default"))
+```
+
+## Fit Marginals
+
+### Extract and Fit Distributions to Each Closure Cause
+
+Simulated data are split into two groups by event type, and several candidate distributions are fitted to each. Model selection is based on AIC, with shape and AIC difference tolerances used to determine if an exponential fit can acceptably replace a Weibull.
+
+```{r fit-marginals}
+# Extract marginals by event type
+repayment <- subset(simulated_data, event_type == 1)$closure_time
+default   <- subset(simulated_data, event_type == 2)$closure_time
+
+# Candidate distributions
+fit_candidates <- c("exp", "weibull", "gamma", "lnorm")
+
+# Tuning parameters for model selection
+shape_tol   <- 0.2   # Accept exponential if Weibull shape ≈ 1 and
+aic_pct_tol <- 0.05  # if AIC within 5% of exponential's AIC
+
+# Function to fit and select best distribution
+fit_dist <- function(data) {
+  fits <- setNames(lapply(fit_candidates, function(d) suppressWarnings(fitdist(data, d))), fit_candidates)
+  aics <- sapply(fits, function(fit) fit$aic)
+  best_fit <- names(which.min(aics))
+  
+  # Override Weibull if close to exponential
+  if (best_fit == "weibull") {
+    shape_diff   <- abs(fits[["weibull"]]$estimate["shape"] - 1)
+    aic_diff_pct <- abs(aics["weibull"] - aics["exp"]) / abs(aics["exp"])
+    
+    if (shape_diff < shape_tol && aic_diff_pct < aic_pct_tol) {
+      best_fit <- "exp"
+    }
+  }
+
+  list(
+    best_fit   = best_fit,
+    parameters = fits[[best_fit]]$estimate,
+    aics       = aics
+  )
+}
+
+# Apply fitting function to each cause
+fit_repayment <- fit_dist(repayment)
+fit_default   <- fit_dist(default)
+
+# Output best-fitting distribution for each cause
+cat("Repayment best fit:", fit_repayment$best_fit, "\n")
+cat("Default best fit:", fit_default$best_fit, "\n")
+```
+
+### Visualize Q-Q Plots of Fitted Marginals
+
+These plots help visually assess how well the fitted distributions match the empirical data.
+
+```{r qq-plots}
+par(mfrow = c(1, 2))
+
+# Repayment Q-Q plot
+qqplot(qexp(ppoints(length(repayment)), rate = fit_repayment$parameters["rate"]),
+       repayment,
+       main = "Q-Q Plot: Repayment",
+       xlab = "Theoretical Quantiles", ylab = "Sample Quantiles")
+abline(0, 1, col = "red")
+
+# Default Q-Q plot
+qqplot(qexp(ppoints(length(default)), rate = fit_default$parameters["rate"]),
+       default,
+       main = "Q-Q Plot: Default",
+       xlab = "Theoretical Quantiles", ylab = "Sample Quantiles")
+abline(0, 1, col = "red")
+```
+
+## Estimate Parameters
+
+The Clayton copula was chosen for the final model because it models lower tail dependence, which is appropriate for competing risks scenarios where extreme (early) failure in one component may increase the likelihood of failure in the other. This reflects real-world settings where risks may be correlated during stress events, making Clayton a natural and interpretable choice.
+
+### Single Parameter Estimate (MLE)
+
+Maximum likelihood estimation is used on the full synthetic dataset to estimate the copula dependence parameter (θ) and the exponential rates (λ₁, λ₂).
+
+```{r mle-estimation}
+# Clayton conditional survival probability
+conditional_clayton <- function(u1, u2, theta) {
+  epsilon <- 1e-10
+  u1 <- min(max(u1, epsilon), 1 - epsilon)
+  u2 <- min(max(u2, epsilon), 1 - epsilon)
+  
+  term <- u1^(-theta) + u2^(-theta) - 1
+  1 - term^(-(1 + 1/theta)) * u1^(-(1 + theta))
+}
+
+# Full log-likelihood for competing risks with Clayton copula
+loglik_full <- function(params, data) {
+  theta   <- params[1]
+  lambda1 <- params[2]
+  lambda2 <- params[3]
+  
+  if (theta <= 0 || lambda1 <= 0 || lambda2 <= 0) return(-1e10)
+  
+  log_lik <- 0
+  for (i in 1:nrow(data)) {
+    t    <- data$closure_time[i]
+    type <- data$event_type[i]
+    
+    F1 <- 1 - exp(-lambda1 * t)
+    F2 <- 1 - exp(-lambda2 * t)
+    
+    if (type == 1) {
+      f1 <- lambda1 * exp(-lambda1 * t)
+      cond_prob <- conditional_clayton(F1, F2, theta)
+      p <- f1 * cond_prob
+    } else {
+      f2 <- lambda2 * exp(-lambda2 * t)
+      cond_prob <- conditional_clayton(F2, F1, theta)
+      p <- f2 * cond_prob
+    }
+    
+    if (!is.finite(p) || p <= 0) return(-1e10)
+    log_lik <- log_lik + log(p)
+  }
+  
+  return(log_lik)
+}
+
+# Negative log-likelihood for optimization
+neg_loglik <- function(params, data) -loglik_full(params, data)
+
+# MLE optimization
+init_params   <- c(1, 1, 1)
+lower_bounds  <- c(1e-6, 1e-6, 1e-6)
+upper_bounds  <- c(1000, 1000, 1000)
+
+result <- optim(par = init_params,
+                fn = neg_loglik,
+                data = simulated_data,
+                method = "L-BFGS-B",
+                lower = lower_bounds,
+                upper = upper_bounds)
+
+# Output point estimates
+cat("Estimated theta:   ", result$par[1], "\n")
+cat("Estimated lambda1: ", result$par[2], "\n")
+cat("Estimated lambda2: ", result$par[3], "\n")
+```
+
+```{r true}
+# Output true values
+cat("True theta:   ", copula_theta, "\n")
+cat("True lambda1: ", exp_rate1, "\n")
+cat("True lambda2: ", exp_rate2, "\n")
+```
+
+### Parameter Distribution (Bootstrap)
+
+Bootstrap resampling is applied to assess uncertainty in the parameter estimates, producing a distribution of estimates for θ, λ₁, and λ₂.
+
+```{r bootstrap, cache = TRUE}
+set.seed(6)
+
+# ~13min runtime
+n_boot      <- 500
+sample_size <- 2000
+boot_results <- matrix(NA, nrow = n_boot, ncol = 3)
+colnames(boot_results) <- c("theta", "lambda1", "lambda2")
+
+for (b in 1:n_boot) {
+  sample_data <- simulated_data[sample(1:nrow(simulated_data), sample_size, replace = TRUE), ]
+  
+  fit <- tryCatch({
+    optim(par = c(1, 1, 1),
+          fn = neg_loglik,
+          data = sample_data,
+          method = "L-BFGS-B",
+          lower = c(1e-6, 1e-6, 1e-6),
+          upper = c(1000, 1000, 1000))
+  }, error = function(e) NULL)
+  
+  if (!is.null(fit) && fit$convergence == 0) {
+    boot_results[b, ] <- fit$par
+  }
+}
+
+# Remove NA rows from failed fits
+boot_results <- boot_results[complete.cases(boot_results), ]
+
+# Summary of bootstrap distribution
+summary(as.data.frame(boot_results))
+```
+
+### Visualize Parameter Estimates
+
+The distribution of bootstrap estimates for each parameter is visualized. Each plot shows a black dashed line for the known true value used to generate the synthetic data and a red solid line for the MLE point estimate from the full dataset.
+
+```{r param-est-hist}
+# True parameter values
+true_theta   <- copula_theta
+true_lambda1 <- exp_rate1
+true_lambda2 <- exp_rate2
+
+# MLE estimates from earlier `result` object
+mle_theta   <- result$par[1]
+mle_lambda1 <- result$par[2]
+mle_lambda2 <- result$par[3]
+
+# Convert to data frame
+boot_df <- as.data.frame(boot_results)
+
+# Theta
+hist(boot_df$theta, breaks = 30, col = "lightblue",
+     main = expression(paste("Theta Estimates")),
+     xlab = expression(theta))
+
+abline(v = true_theta, col = "black", lwd = 2, lty = 2)  # True value
+abline(v = mle_theta, col = "red", lwd = 2, lty = 2)     # MLE estimate
+
+legend("topright", legend = c("True Value", "MLE Estimate"),
+       col = c("black", "red"), lty = c(2, 2), lwd = 2)
+
+# Lambda1
+hist(boot_df$lambda1, breaks = 30, col = "lightgreen",
+     main = expression(paste("Lambda[1] Estimates")),
+     xlab = expression(lambda[1]))
+
+abline(v = true_lambda1, col = "black", lwd = 2, lty = 2)
+abline(v = mle_lambda1, col = "red", lwd = 2, lty = 2)
+
+legend("topright", legend = c("True Value", "MLE Estimate"),
+       col = c("black", "red"), lty = c(2, 2), lwd = 2)
+
+# Lambda2
+hist(boot_df$lambda2, breaks = 30, col = "salmon",
+     main = expression(paste("Lambda[2] Estimates")),
+     xlab = expression(lambda[2]))
+
+abline(v = true_lambda2, col = "black", lwd = 2, lty = 2)
+abline(v = mle_lambda2, col = "red", lwd = 2, lty = 2)
+
+legend("topright", legend = c("True Value", "MLE Estimate"),
+       col = c("black", "red"), lty = c(2, 2), lwd = 2)
+```
+
+## Discussion
+
+### Role in the Project
+
+This synthetic implementation serves as a controlled environment to test and demonstrate the use of copulas — specifically the Clayton copula — in modeling competing risks. By simulating data with known dependence and marginal characteristics, the accuracy of parameter estimation methods and their performance can be assessed.
+
+### Simulation Design
+
+10,000 observations were generated representing time-to-event data for two competing risks: **loan repayment** and **loan default**. Dependence between the two failure types was introduced using a **Clayton copula** with a known parameter of **θ = 2**, chosen for its ability to model **lower tail dependence** — appropriate for scenarios where early failure in one increases the risk of failure in another.
+
+The marginal distributions for both risks were set to **exponential**, with **λ₁ = 4** for repayment and **λ₂ = 2.5** for default. Observed closure times were the minimum of the two, with the cause recorded as the corresponding event type.
+
+### Key Observations from Visuals
+
+-   **Copula Scatterplot**: The Clayton copula generated clear lower tail dependence, visible as clustering in the bottom-left of the u1–u2 scatterplot.
+
+-   **Histogram of Closure Times**: Repayments dominated early in the timeline, while default events occurred more evenly across time, consistent with their lower hazard rate.
+
+-   **Q-Q Plots**: Exponential distribution assumptions for both causes were visually supported. The points closely followed the theoretical line, with only mild deviation in the upper tail, confirming good model fit.
+
+-   **Bootstrap Histograms**: The distributions of bootstrap estimates for θ, λ₁, and λ₂ were all centered near their true values, with low spread.
+
+### Comparison of MLE, Bootstrap, and True Values
+
+|               |                |                  |                    |
+|---------------|----------------|------------------|--------------------|
+| **Parameter** | **True Value** | **MLE Estimate** | **Bootstrap Mean** |
+| θ             | 2.00           | 2.31             | 2.45               |
+| λ₁            | 4.00           | 4.02             | 4.04               |
+| λ₂            | 2.50           | 2.60             | 2.62               |
+
+-   **MLE Estimates** were very close to the true values for all parameters, indicating successful recovery of model inputs.
+
+-   **Bootstrap Means** confirmed the stability of these estimates, with distributions tightly clustered around both the true values and the MLEs.
+
+-   **θ** showed slightly more variability across bootstrap samples, which is expected due to its more complex influence on joint behavior. Unlike the marginal rate parameters, which depend only on the individual time distributions, θ governs the dependence structure between the risks, making it more sensitive to variation in the joint tails of the data. This results in greater estimation uncertainty, especially when dependence is moderate or when sample fluctuations disproportionately affect joint failures
+
+### Conclusion
+
+This synthetic implementation successfully demonstrated that copula-based competing risks models can **recover true marginal and dependence parameters with high accuracy**, under ideal conditions. The results validated both the model structure and estimation approach, particularly the use of MLE and bootstrap for parameter inference.
+
+What went well:
+
+-   The estimation process was robust, with both MLE and bootstrap confirming parameter accuracy.
+
+-   Visual checks supported the use of exponential marginals.
+
+Limitations:
+
+-   θ exhibited more spread in bootstrap results, suggesting that dependence parameters may be less stable under resampling.
+
+-   Real-world data may introduce noise, censoring, or model violations not present in this controlled setup.
+
+Nonetheless, this simulation provides a strong foundation for applying the same framework to empirical data.
